@@ -887,24 +887,14 @@ def main():
     dataset = data_generator.generate_dataset(20000)
     
     # 設定模型配置
-    #config = NSAConfig(
-    #    vocab_size=tokenizer.vocab_size,
-    #   max_seq_length=512,
-    #    hidden_size=768,
-    #    num_attention_heads=12,
-    #    num_hidden_layers=6,
-    #    compress_ratio=4,
-    #    select_k=16,
-    #    window_size=64
-    #)
     config = NSAConfig(
         vocab_size=tokenizer.vocab_size,
-        max_seq_length=512,
+       max_seq_length=512,
         hidden_size=768,
         num_attention_heads=12,
-        num_hidden_layers=12,
+        num_hidden_layers=6,
         compress_ratio=4,
-        select_k=32,
+        select_k=16,
         window_size=64
     )
     # 創建模型
