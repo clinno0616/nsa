@@ -225,7 +225,7 @@ def main():
     
     # 初始化测试器
     tester = NSAModelTester(
-        model_path="best_model_checkpoint.pth",
+        model_path="nsa_chinese_model.pth",
         tokenizer=tokenizer
     )
     
