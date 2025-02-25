@@ -5,7 +5,7 @@
 
 A:基於您上傳的論文《Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention》和app.py代碼文件，我將分析實現程度。
 
-## NSA模型與app5.py實現比較
+## NSA模型與app.py實現比較
 
 論文中提出的NSA（Native Sparse Attention）是一種硬件友好、可原生訓練的稀疏注意力機制，主要包含三個關鍵組件：
 
