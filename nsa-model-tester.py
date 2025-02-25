@@ -27,16 +27,21 @@ class NSAModelTester:
     def _load_model(self, model_path: str):
         """加载预训练模型"""
         try:
-            # 从app41.py中导入必要的类
-            from app41 import NSAConfig, NSAModel
+            # 从app5.py中导入必要的类
+            from app5 import NSAConfig, NSAModel
             
             # 初始化配置
             config = NSAConfig(
+                num_routed_experts=4,
+                num_shared_experts=2,
+                expert_capacity_factor=1.25,
+                router_z_loss_coef=0.001,
+                top_k=2,
                 vocab_size=self.tokenizer.vocab_size,
                 max_seq_length=512,
                 hidden_size=768,
-                num_attention_heads=12,
-                num_hidden_layers=6,
+                num_attention_heads=24,
+                num_hidden_layers=12,
                 compress_ratio=4,
                 select_k=16,
                 window_size=64
@@ -84,6 +89,8 @@ class NSAModelTester:
             
             #logger.info(f"Input shape: {input_ids.shape}")
             
+            # 保存輸入的 token 數量
+            input_length = input_ids.shape[1]
             # 初始化输出序列
             output_ids = input_ids.clone()
             current_attention_mask = attention_mask.clone()
@@ -132,8 +139,11 @@ class NSAModelTester:
                     ], dim=1)
             
             # 解码生成的文本
-            generated_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-            return generated_text[len(prompt):]  # 只返回新生成的部分
+            # 解碼生成的文本，僅包含新生成的部分
+            # 注意：這裡從 input_length 開始截取，而不是從原始文本長度
+            generated_tokens = output_ids[0][input_length:]
+            generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            return generated_text  # 只返回新生成的部分
             
         except Exception as e:
             logger.error(f"文本生成失败: {str(e)}")
@@ -226,23 +236,26 @@ def main():
     # 初始化测试器
     tester = NSAModelTester(
         model_path="nsa_chinese_model.pth",
+        #model_path="best_model_checkpoint.pth",
         tokenizer=tokenizer
     )
     
     # 准备测试样例
     test_prompts = [
-        "夏天的海邊",
-        "這是一個平和的冬天",
-        "關於科技創新",
-        "面對面對挑戰，內心充滿了喜悅，不禁想到過去的經歷。"
+        "將控制論應用於電子",
+        "根據監測資料分析",
+        "朋友和小華討論著環境保護",
+        "行為分析表明觀察發現的正確性",
+        "過程優化得到了創新方案的解決方案",
+        "共價鍵技術突破"
     ]
     
     # 参考答案（用于评估）
     reference_texts = [
-        "陽光明媚，微風輕拂，是個適合出門散步的好日子。",
-        "看到了技術進步帶來的巨大變革，但也要警惕其潛在風險。",
-        "深厚的歷史積澱，需要我們繼續傳承和發揚。",
-        "人工智能將與人類共同創造更美好的生活。"
+        "阳光明媚，微风轻拂，是个适合出门散步的好日子。",
+        "看到了技术进步带来的巨大变革，但也要警惕其潜在风险。",
+        "深厚的历史积淀，需要我们继续传承和发扬。",
+        "人工智能将与人类共同创造更美好的生活。"
     ]
     
     # 运行测试
