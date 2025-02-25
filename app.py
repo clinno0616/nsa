@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional
 import math
 import random
-from chinese_data_generator02 import ChineseDataGenerator
+from chinese_data_generator03 import ChineseDataGenerator
 import logging
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -18,7 +18,7 @@ from torch.optim import lr_scheduler
 import gc
 import os
 import time, datetime
-
+import torch.nn.functional as F
 
 # 设置日志记录
 logging.basicConfig(level=logging.INFO)
@@ -341,9 +341,9 @@ class OptimizedTrainer:
             
             logger.info(
                 f"\nEpoch {epoch+1} Summary:\n"
-                f"Average Loss: {epoch_avg_loss:.6f}\n"
+                f"Average Loss: {epoch_avg_loss:.12f}\n"
                 f"Time Elapsed: {datetime.timedelta(seconds=int(epoch_time))}\n"
-                f"Learning Rate: {self.scheduler.get_last_lr()[0]:.8f}"
+                f"Learning Rate: {self.scheduler.get_last_lr()[0]:.12f}"
             )
             
             # 更新epoch指標
@@ -393,7 +393,7 @@ class OptimizedTrainer:
         
         logger.info(
             f"\nValidation Results:\n"
-            f"Average Loss: {avg_loss:.6f}\n"
+            f"Average Loss: {avg_loss:.12f}\n"
             f"Time Elapsed: {datetime.timedelta(seconds=int(eval_time))}"
         )
         
@@ -413,10 +413,156 @@ class OptimizedTrainer:
         else:
             self.model.load_state_dict(torch.load(path))
 
+class NSAAttentionExtendedWithRouting(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.head_size = self.hidden_size // self.num_attention_heads
+        self.all_head_size = self.num_attention_heads * self.head_size
+        self.scale = 1.0 / math.sqrt(self.head_size)
+        
+        # 設定專家數量
+        self.num_routed_experts = 4  # 路由專家數量
+        self.num_shared_experts = 2  # 共享專家數量
+        self.num_total_experts = self.num_routed_experts + self.num_shared_experts
+        self.top_k = 2  # 每次選擇的專家數量
+        
+        # 路由器
+        self.router = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.num_routed_experts)
+        )
+        
+        # 專家初始化
+        self.routed_experts = nn.ModuleList([
+            self._create_expert() for _ in range(self.num_routed_experts)
+        ])
+        
+        self.shared_experts = nn.ModuleList([
+            self._create_expert() for _ in range(self.num_shared_experts)
+        ])
+        
+        # 輸出層
+        self.output = nn.Linear(self.hidden_size, self.hidden_size)
+        self.dropout = nn.Dropout(0.1)
+        
+        # 負載平衡係數
+        self.router_z_loss_coef = 0.001
+        self.expert_capacity_factor = 1.25
+        
+    def _create_expert(self):
+        """創建單個專家模塊"""
+        return nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size * 4),
+            nn.GELU(),
+            nn.Linear(self.hidden_size * 4, self.hidden_size),
+            nn.Dropout(0.1)
+        )
+        
+    def _compute_routing_probabilities(self, hidden_states):
+        """計算路由概率"""
+        # 計算路由分數
+        routing_logits = self.router(hidden_states)  # [batch, seq_len, num_routed_experts]
+        
+        # 應用 top-k gating
+        top_k_logits, top_k_indices = torch.topk(
+            routing_logits, 
+            self.top_k, 
+            dim=-1
+        )
+        
+        # 計算 softmax 概率
+        routing_weights = F.softmax(top_k_logits, dim=-1)
+        
+        # 計算路由器 z-loss (用於穩定訓練)
+        z_loss = torch.mean(torch.square(torch.logsumexp(
+            routing_logits, 
+            dim=-1
+        )))
+        
+        return routing_weights, top_k_indices, z_loss
+        
+    def _compute_expert_capacity(self, batch_size, seq_length):
+        """計算每個專家的容量"""
+        tokens_per_expert = batch_size * seq_length / self.num_routed_experts
+        capacity = int(tokens_per_expert * self.expert_capacity_factor)
+        return capacity
+        
+    def forward(self, hidden_states, attention_mask=None):
+        batch_size, seq_length, _ = hidden_states.size()
+        
+        # 1. 路由計算
+        routing_weights, top_k_indices, z_loss = self._compute_routing_probabilities(
+            hidden_states
+        )
+        
+        # 2. 計算專家容量
+        expert_capacity = self._compute_expert_capacity(batch_size, seq_length)
+        
+        # 3. 初始化輸出張量
+        final_output = torch.zeros_like(hidden_states)
+        
+        # 4. 處理路由專家
+        for i in range(self.top_k):
+            expert_idx = top_k_indices[..., i]  # [batch_size, seq_length]
+            token_weight = routing_weights[..., i]  # [batch_size, seq_length]
+            
+            # 為每個專家收集輸入
+            for j in range(self.num_routed_experts):
+                # 創建專家遮罩 [batch_size, seq_length]
+                expert_mask = (expert_idx == j)
+                if not expert_mask.any():
+                    continue
+                
+                # 獲取需要處理的位置
+                batch_indices, seq_indices = torch.where(expert_mask)
+                
+                # 收集需要處理的輸入
+                expert_input = hidden_states[batch_indices, seq_indices]
+                
+                if len(expert_input) > expert_capacity:
+                    # 如果超過容量，隨機選擇tokens
+                    perm = torch.randperm(len(expert_input))[:expert_capacity]
+                    expert_input = expert_input[perm]
+                    batch_indices = batch_indices[perm]
+                    seq_indices = seq_indices[perm]
+                
+                # 專家處理
+                expert_output = self.routed_experts[j](expert_input)
+                
+                # 獲取對應的權重
+                current_token_weight = token_weight[batch_indices, seq_indices].unsqueeze(-1)
+                
+                # 應用權重並更新最終輸出
+                final_output[batch_indices, seq_indices] += current_token_weight * expert_output
+        
+        # 5. 處理共享專家
+        shared_weight = 1.0 / self.num_shared_experts
+        for expert in self.shared_experts:
+            final_output += shared_weight * expert(hidden_states)
+        
+        # 6. 最終輸出處理
+        output = self.output(final_output)
+        output = self.dropout(output)
+        
+        # 7. 殘差連接和正規化
+        output = output * 0.5 + hidden_states * 0.5
+        output = F.layer_norm(
+            output,
+            [output.size(-1)],
+            eps=1e-6
+        )
+        
+        return output, z_loss
+
 class NSAConfig:
     def __init__(
         self,
-        vocab_size: int = 21128,  # BERT中文詞表大小
+        vocab_size: int = 21128,
         max_seq_length: int = 512,
         hidden_size: int = 768,
         num_attention_heads: int = 12,
@@ -424,6 +570,11 @@ class NSAConfig:
         compress_ratio: int = 4,
         select_k: int = 16,
         window_size: int = 64,
+        num_routed_experts: int = 4,
+        num_shared_experts: int = 2,
+        expert_capacity_factor: float = 1.25,
+        router_z_loss_coef: float = 0.001,
+        top_k: int = 2
     ):
         self.vocab_size = vocab_size
         self.max_seq_length = max_seq_length
@@ -433,6 +584,12 @@ class NSAConfig:
         self.compress_ratio = compress_ratio
         self.select_k = select_k
         self.window_size = window_size
+        # 新增的MoE相關配置
+        self.num_routed_experts = num_routed_experts
+        self.num_shared_experts = num_shared_experts
+        self.expert_capacity_factor = expert_capacity_factor
+        self.router_z_loss_coef = router_z_loss_coef
+        self.top_k = top_k
 
 class NSAAttentionExtended(nn.Module):
     def __init__(self, config):
@@ -611,52 +768,76 @@ class NSAAttentionExtended(nn.Module):
         return output
 
     def forward(self, hidden_states, attention_mask=None):
-        """前向传播"""
         batch_size, seq_length, _ = hidden_states.size()
         
-        # 计算分支权重
-        gates = self.branch_gate(hidden_states)
-        gates = torch.sigmoid(gates)
-        gates = gates / (gates.sum(dim=-1, keepdim=True) + 1e-6)
+        # 1. 路由計算
+        routing_weights, top_k_indices, z_loss = self._compute_routing_probabilities(
+            hidden_states
+        )
         
-        # 分别处理每个分支
-        compress_output = self.compress_attention(hidden_states, attention_mask)
-        select_output = self.select_attention(hidden_states, attention_mask)
-        window_output = self.window_attention(hidden_states, attention_mask)
+        # 2. 計算專家容量
+        expert_capacity = self._compute_expert_capacity(batch_size, seq_length)
         
-        # 确保所有输出具有相同的大小
-        compress_output = self._adjust_tensor_size(compress_output, seq_length)
-        select_output = self._adjust_tensor_size(select_output, seq_length)
-        window_output = self._adjust_tensor_size(window_output, seq_length)
+        # 3. 初始化輸出張量
+        final_output = torch.zeros_like(hidden_states)
         
-        # 应用门控
-        gated_compress = compress_output * gates[..., 0:1]
-        gated_select = select_output * gates[..., 1:2]
-        gated_window = window_output * gates[..., 2:3]
+        # 4. 處理路由專家
+        for i in range(self.top_k):
+            expert_idx = top_k_indices[..., i]  # [batch_size, seq_length]
+            token_weight = routing_weights[..., i]  # [batch_size, seq_length]
+            
+            # 為每個專家收集輸入
+            for j in range(self.num_routed_experts):
+                # 創建專家遮罩 [batch_size, seq_length]
+                expert_mask = (expert_idx == j)
+                if not expert_mask.any():
+                    continue
+                
+                # 獲取需要處理的位置
+                batch_indices, seq_indices = torch.where(expert_mask)
+                
+                # 收集需要處理的輸入
+                expert_input = hidden_states[batch_indices, seq_indices]
+                
+                if len(expert_input) > expert_capacity:
+                    # 如果超過容量，隨機選擇tokens
+                    perm = torch.randperm(len(expert_input))[:expert_capacity]
+                    expert_input = expert_input[perm]
+                    batch_indices = batch_indices[perm]
+                    seq_indices = seq_indices[perm]
+                
+                # 專家處理
+                expert_output = self.routed_experts[j](expert_input)
+                
+                # 獲取對應的權重
+                current_token_weight = token_weight[batch_indices, seq_indices].unsqueeze(-1)
+                
+                # 應用權重並更新最終輸出
+                final_output[batch_indices, seq_indices] += current_token_weight * expert_output
         
-        # 合并输出
-        combined = torch.cat([gated_compress, gated_select, gated_window], dim=-1)
+        # 5. 處理共享專家
+        shared_weight = 1.0 / self.num_shared_experts
+        for expert in self.shared_experts:
+            final_output += shared_weight * expert(hidden_states)
         
-        # 最终输出
-        output = self.output(combined)
-        output = self.output_dropout(output)
+        # 6. 最終輸出處理
+        output = self.output(final_output)
+        output = self.dropout(output)
         
-        # 残差连接和归一化
+        # 7. 殘差連接和正規化
         output = output * 0.5 + hidden_states * 0.5
-        output = nn.functional.layer_norm(
+        output = F.layer_norm(
             output,
             [output.size(-1)],
-            weight=None,
-            bias=None,
             eps=1e-6
         )
         
-        return output
+        return output, z_loss
 
 class NSABlockExtended(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.attention = NSAAttentionExtended(config)
+        self.attention = NSAAttentionExtendedWithRouting(config)
         self.intermediate = nn.Linear(config.hidden_size, config.hidden_size * 4)
         self.output = nn.Linear(config.hidden_size * 4, config.hidden_size)
         self.layernorm1 = nn.LayerNorm(config.hidden_size)
@@ -664,8 +845,12 @@ class NSABlockExtended(nn.Module):
         self.dropout = nn.Dropout(0.1)
         self.activation = nn.GELU()
         
+        # 儲存配置以獲取z_loss係數
+        self.config = config
+        
     def forward(self, hidden_states, attention_mask=None):
-        attention_output = self.attention(hidden_states, attention_mask)
+        # 獲取attention輸出和z_loss
+        attention_output, z_loss = self.attention(hidden_states, attention_mask)
         hidden_states = self.layernorm1(hidden_states + attention_output)
         
         intermediate_output = self.intermediate(hidden_states)
@@ -675,14 +860,16 @@ class NSABlockExtended(nn.Module):
         layer_output = self.dropout(layer_output)
         
         output = self.layernorm2(hidden_states + layer_output)
-        return output
+        
+        # 返回輸出和z_loss
+        return output, z_loss
 
 class NSAModel(nn.Module):
     def __init__(self, config: NSAConfig):
         super().__init__()
         self.config = config
         
-        # Keep original embedding structure
+        # 原有的初始化代碼
         self.embeddings = nn.Embedding(
             config.vocab_size,
             config.hidden_size,
@@ -693,21 +880,20 @@ class NSAModel(nn.Module):
             config.hidden_size
         )
         
-        # Initialize embeddings with small values
+        # 初始化embeddings
         nn.init.normal_(self.embeddings.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.position_embeddings.weight, mean=0.0, std=0.02)
         
-        # Keep original layer structure
+        # 使用新的NSABlockExtended
         self.layers = nn.ModuleList(
             [NSABlockExtended(config) for _ in range(config.num_hidden_layers)]
         )
         
-        # Keep original normalization and head
         self.layernorm = nn.LayerNorm(config.hidden_size)
         self.dropout = nn.Dropout(0.1)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
         
-        # Initialize lm_head
+        # 初始化lm_head
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.lm_head.bias)
         
@@ -717,39 +903,62 @@ class NSAModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Get embeddings with gradient clipping
+        # 獲取embeddings並加入梯度裁剪
         hidden_states = self.embeddings(input_ids)
         hidden_states = torch.clamp(hidden_states, min=-100, max=100)
         
-        # Add position embeddings
-        position_ids = torch.arange(input_ids.size(1), dtype=torch.long, device=input_ids.device)
+        # 添加位置embeddings
+        position_ids = torch.arange(
+            input_ids.size(1), 
+            dtype=torch.long, 
+            device=input_ids.device
+        )
         position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
-        position_embeddings = torch.clamp(position_embeddings, min=-100, max=100)
+        position_embeddings = torch.clamp(
+            position_embeddings, 
+            min=-100, 
+            max=100
+        )
         
-        # Combine embeddings
+        # 合併embeddings
         hidden_states = hidden_states + position_embeddings
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.layernorm(hidden_states)
         
-        # Process through transformer layers with stability improvements
-        for layer in self.layers:
-            layer_output = layer(hidden_states, attention_mask)
-            # Add scaled residual connection
-            hidden_states = hidden_states * 0.5 + layer_output * 0.5
-            # Clip values to prevent explosion
-            hidden_states = torch.clamp(hidden_states, min=-100, max=100)
+        # 追蹤總的z_loss
+        total_z_loss = 0.0
         
-        # Generate logits with careful scaling
+        # 通過transformer層處理
+        for layer in self.layers:
+            layer_output, z_loss = layer(hidden_states, attention_mask)
+            # 添加縮放的殘差連接
+            hidden_states = hidden_states * 0.5 + layer_output * 0.5
+            # 裁剪值以防止爆炸
+            hidden_states = torch.clamp(hidden_states, min=-100, max=100)
+            # 累積z_loss
+            total_z_loss += z_loss
+        
+        # 生成logits並小心縮放
         prediction_scores = self.lm_head(hidden_states)
         prediction_scores = prediction_scores / math.sqrt(self.config.hidden_size)
         prediction_scores = torch.clamp(prediction_scores, min=-100, max=100)
         
-        # Calculate loss if labels are provided
+        # 如果提供了標籤，計算損失
         if labels is not None:
+            # 主要的交叉熵損失
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
-            return loss
+            ce_loss = loss_fct(
+                prediction_scores.view(-1, self.config.vocab_size), 
+                labels.view(-1)
+            )
+            
+            # 添加加權的z_loss到總損失
+            z_loss_weight = getattr(self.config, 'router_z_loss_coef', 0.001)
+            avg_z_loss = total_z_loss / len(self.layers)
+            total_loss = ce_loss + z_loss_weight * avg_z_loss
+            
+            return total_loss
             
         return prediction_scores
 
@@ -884,15 +1093,22 @@ def main():
     
     # 生成訓練數據
     data_generator = ChineseDataGenerator()
-    dataset = data_generator.generate_dataset(20000)
+    dataset = data_generator.generate_dataset(30000)
     
-    # 設定模型配置
+    #設定模型配置
     config = NSAConfig(
+        num_routed_experts=6,
+        num_shared_experts=2,
+        expert_capacity_factor=1.25,
+        router_z_loss_coef=0.001,
+        top_k=2,
         vocab_size=tokenizer.vocab_size,
-       max_seq_length=512,
+        max_seq_length=512,
         hidden_size=768,
-        num_attention_heads=12,
-        num_hidden_layers=6,
+        #num_attention_heads=12,
+        #num_hidden_layers=6,
+        num_attention_heads=24,
+        num_hidden_layers=12,
         compress_ratio=4,
         select_k=16,
         window_size=64
@@ -919,7 +1135,7 @@ def main():
         test_dataset=test_dataset,
         batch_size=16,
         learning_rate=1e-5,
-        num_epochs=30,
+        num_epochs=6,
         gradient_accumulation_steps=4,
         mixed_precision=True
     )
