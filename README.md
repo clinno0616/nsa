@@ -1,5 +1,5 @@
-## 基於 Claude 3.7 Sonnet 上傳NSA論文與app.py，比對實作app.py是否符合論文的技術細節QA。
-(使用硬體規格：i7-14代、Nvidia RTX 4060 Ti-16G)
+## 基於 Claude 3.7 Sonnet 上傳NSA論文與app.py，比對實作app.py是否符合論文的技術細節。
+使用硬體規格：i7-14代、Nvidia RTX 4060 Ti-16G
 
 ## Q: 仔細檢視2502.11089v1.pdf中的論文技術相關資訊，重新檢查app.py的程式是否確實實作了論文的所有技術細節
 
